@@ -1,0 +1,161 @@
+---
+- hosts: all
+  pre_tasks:
+    - name: 'install python2 (because ansible needs it, but xenial does not provide it by default)'
+      raw: sudo apt-get -y install python
+  vars_files:
+    - secrets_vars.yml
+  vars:
+    packages:
+      - python
+      - python3
+      - python-pip
+      - python-virtualenv
+      - vim
+      - binutils
+      - tree
+      - language-pack-pl
+      - postgresql-client
+      - redis-tools
+      - redis-server
+      - coffeescript
+
+    home_dir: '/home/ubuntu'
+    web_base_dir: '/home/ubuntu/better3'
+    media_dir: '/better3/media'
+    project_dir: '/better3'
+    static_root: '/pseudo_static_server_spots'
+    celery_worker: 'better3'
+    app_user: 'ubuntu'
+    proxy_env:
+      DB_PASSWORD: "{{db_password}}"
+      DJANGO_SECRET_KEY: "{{ django_secret_key }}"
+      EMAIL_HOST_PASSWORD: "{{ gmail_password }}"
+      GOOGLE_API_KEY: "{{ google_api_key }}"
+
+  gather_facts: no
+  environment: "{{proxy_env}}"
+  tasks:
+
+  - name: Install packages
+    sudo: yes
+    apt: pkg={{ item }} state=present update_cache=yes
+    with_items: "{{ packages }}"
+
+  - name: Add the PostgreSQL public GPG key to the apt repo
+    sudo: yes
+    apt_key: url=https://www.postgresql.org/media/keys/ACCC4CF8.asc
+             state=present
+
+  - name: Add PostgreSQL to the sources list
+    sudo: yes
+    apt_repository: repo='deb http://apt.postgresql.org/pub/repos/apt/ xenial-pgdg main'
+                    update_cache=yes
+                    state=present
+
+  - name: Install PostgreSQL
+    sudo: yes
+    apt: name={{ item }} update_cache=yes state=installed
+    with_items:
+      - postgresql
+      - postgresql-contrib
+      - postgresql-9.6-postgis-scripts #TODO make it postgres version parametrized
+      - python-psycopg2
+    tags: packages
+
+  - name: Ensure the PostgreSQL service is running
+    service: name=postgresql state=started enabled=yes
+
+  - name: Ensure database is created
+    become_user: postgres
+    become: yes
+    postgresql_db: name='better3'
+                   encoding='UTF-8'
+                   lc_collate='en_US.UTF-8'
+                   lc_ctype='en_US.UTF-8'
+                   template='template0'
+                   state=present
+
+  - name: Ensure user has access to the database
+    become_user: postgres
+    become: yes
+    postgresql_user:
+      db: 'better3'
+      name: 'better3'
+      password: '{{db_password}}'
+      priv: ALL
+      state: present
+
+  - name: Ensure user does not have unnecessary privileges
+    become_user: postgres
+    become: yes
+    postgresql_user: name='better3'
+                     role_attr_flags=NOSUPERUSER,NOCREATEDB
+                     state=present
+
+  - name: Add postgis extension
+    become_user: postgres
+    become: yes
+    postgresql_ext:
+      name: postgis
+      db: better3
+
+  - name: Add hstore extension
+    become_user: postgres
+    become: yes
+    postgresql_ext:
+      name: hstore
+      db: better3
+
+  - name: Create media directories
+    sudo: yes
+    file: path="{{ item }}" state=directory
+    with_items:
+      - "{{ media_dir }}/img"
+
+  - name: Craete STATIC_ROOT
+    sudo: yes
+    file: path="{{ item }}" owner='ubuntu' group='ubuntu' mode=0775 state=directory
+    with_items:
+      - "{{ static_root }}"
+
+  - name: create virtualenv for python 3.5
+    sudo: yes
+    command: creates={{ web_base_dir }}/venv virtualenv -p python3.5 {{ web_base_dir }}/venv
+
+  - name: install pip packages
+    sudo: yes
+    pip: virtualenv={{ web_base_dir }}/venv
+         requirements=/better3/requirements.txt
+
+  - name: activate virtualenv, navigate to project dir
+    lineinfile:
+      dest: "{{ home_dir }}/.bashrc"
+      state: present
+      line: "{{ item }}"
+    with_items:
+      - "source {{ web_base_dir }}/venv/bin/activate"
+      - "cd {{ project_dir }}"
+
+  # todo this needs refactor using nohup isn't cool, and different strategies of running celery for develop and production needed
+  - name: start celery
+    sudo: yes
+    shell: "nohup {{ web_base_dir }}/venv/bin/celery -A {{ celery_worker }} worker &"
+    args:
+      chdir: "{{ project_dir }}"
+      executable: /bin/bash
+
+  # TODO setup git
+
+  - name: save environment variables into .app_environemnts file
+    lineinfile:
+      dest: "{{ home_dir }}/.app_environemnts"
+      regexp: "^export {{ item.key }}"
+      line: "export {{ item.key }}='{{ item.value }}'"
+      create: yes
+    with_dict: "{{proxy_env}}"
+
+  - name: add sourcing the .app_environemnts file to the .profile file
+    lineinfile:
+      dest: "{{ home_dir }}/.profile"
+      line: "source ~/.app_environemnts"
